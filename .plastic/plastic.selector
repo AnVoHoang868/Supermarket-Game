@@ -1,4 +1,0 @@
-repository "SupermarketGame/SupermarketGame@18968328954115@cloud"
-  path "/"
-    br "/main"
-    co "/main"
