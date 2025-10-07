@@ -7,8 +7,8 @@ using System.Linq;
 namespace Shared.Networking
 {
     /// <summary>
-    /// Manages user sessions across the client-server architecture
-    /// Handles session persistence, validation, and cleanup
+    /// Manages user sessions with persistence, validation, and automatic cleanup
+    /// Tracks active sessions across client-server connections
     /// </summary>
     public class SessionManager : NetworkBehaviour
     {
@@ -17,25 +17,20 @@ namespace Shared.Networking
         [Header("Session Settings")]
         [SerializeField] private float sessionTimeoutMinutes = 30f;
         [SerializeField] private float cleanupIntervalSeconds = 60f;
-        [SerializeField] private bool enableSessionPersistence = true;
         [SerializeField] private bool debugMode = true;
         
         // Events
         public event Action<string> OnSessionCreated; // sessionId
         public event Action<string> OnSessionExpired; // sessionId
-        public event Action<string, SessionData> OnSessionUpdated; // sessionId, sessionData
+        public event Action<string> OnSessionDestroyed; // sessionId
         
         // Session storage
-        private Dictionary<string, SessionData> _sessions = new Dictionary<string, SessionData>();
+        private Dictionary<string, UserSession> _activeSessions = new Dictionary<string, UserSession>();
         private Dictionary<ulong, string> _clientToSession = new Dictionary<ulong, string>();
-        private SessionData _localSession;
-        
-        // Timing
         private float _lastCleanupTime;
         
-        public SessionData LocalSession => _localSession;
-        public bool HasActiveSession => _localSession != null && _localSession.IsValid;
-        public string LocalSessionId => _localSession?.SessionId;
+        public int ActiveSessionCount => _activeSessions.Count;
+        public TimeSpan SessionTimeout => TimeSpan.FromMinutes(sessionTimeoutMinutes);
         
         void Awake()
         {
@@ -48,17 +43,17 @@ namespace Shared.Networking
             DontDestroyOnLoad(gameObject);
         }
 
-        void Start()
+        public override void OnNetworkSpawn()
         {
-            if (enableSessionPersistence && IsClient)
-            {
-                LoadLocalSession();
-            }
+            if (debugMode)
+                Debug.Log($"[SessionManager] NetworkSpawn - IsServer: {IsServer}, IsClient: {IsClient}");
+                
+            _lastCleanupTime = Time.time;
         }
 
         void Update()
         {
-            if (IsServer && Time.time - _lastCleanupTime > cleanupIntervalSeconds)
+            if (IsServer && Time.time - _lastCleanupTime >= cleanupIntervalSeconds)
             {
                 CleanupExpiredSessions();
                 _lastCleanupTime = Time.time;
@@ -68,18 +63,18 @@ namespace Shared.Networking
         #region Public API
         
         /// <summary>
-        /// Creates a new session for the authenticated user
+        /// Creates a new session for a user (server only)
         /// </summary>
-        public void CreateSession(string userId, string displayName, bool isGuest = false)
+        public string CreateSession(string userId, string displayName, bool isGuest = false)
         {
             if (!IsServer)
             {
-                Debug.LogError("[SessionManager] CreateSession can only be called from server");
-                return;
+                Debug.LogError("[SessionManager] CreateSession can only be called on server");
+                return null;
             }
             
             var sessionId = Guid.NewGuid().ToString();
-            var session = new SessionData
+            var session = new UserSession
             {
                 SessionId = sessionId,
                 UserId = userId,
@@ -87,73 +82,48 @@ namespace Shared.Networking
                 IsGuest = isGuest,
                 CreatedAt = DateTime.UtcNow,
                 LastActivity = DateTime.UtcNow,
-                ExpiresAt = DateTime.UtcNow.AddMinutes(sessionTimeoutMinutes)
+                IsActive = true
             };
             
-            _sessions[sessionId] = session;
+            _activeSessions[sessionId] = session;
             
             if (debugMode)
-                Debug.Log($"[SessionManager] Session created - ID: {sessionId}, User: {userId}");
+                Debug.Log($"[SessionManager] Session created - SessionId: {sessionId}, UserId: {userId}");
             
             OnSessionCreated?.Invoke(sessionId);
+            return sessionId;
         }
         
         /// <summary>
-        /// Associates a client with a session
+        /// Associates a session with a client ID (server only)
         /// </summary>
-        public void AssignSessionToClient(ulong clientId, string sessionId)
+        public void AssignSessionToClient(ulong clientId, string userId)
         {
-            if (!IsServer)
-            {
-                Debug.LogError("[SessionManager] AssignSessionToClient can only be called from server");
-                return;
-            }
+            if (!IsServer) return;
             
-            if (_sessions.ContainsKey(sessionId))
+            var session = _activeSessions.Values.FirstOrDefault(s => s.UserId == userId && s.IsActive);
+            if (session != null)
             {
-                _clientToSession[clientId] = sessionId;
+                _clientToSession[clientId] = session.SessionId;
+                session.ClientId = clientId;
                 
                 if (debugMode)
-                    Debug.Log($"[SessionManager] Client {clientId} assigned to session {sessionId}");
-                
-                // Send session data to client
-                var session = _sessions[sessionId];
-                SendSessionDataClientRpc(session, new ClientRpcParams 
-                { 
-                    Send = new ClientRpcSendParams { TargetClientIds = new[] { clientId } } 
-                });
+                    Debug.Log($"[SessionManager] Session assigned to client - ClientId: {clientId}, SessionId: {session.SessionId}");
             }
         }
         
         /// <summary>
-        /// Updates session activity timestamp
+        /// Gets a session by session ID
         /// </summary>
-        public void UpdateSessionActivity(string sessionId)
+        public UserSession GetSession(string sessionId)
         {
-            if (_sessions.TryGetValue(sessionId, out var session))
-            {
-                session.LastActivity = DateTime.UtcNow;
-                session.ExpiresAt = DateTime.UtcNow.AddMinutes(sessionTimeoutMinutes);
-                
-                OnSessionUpdated?.Invoke(sessionId, session);
-                
-                if (debugMode)
-                    Debug.Log($"[SessionManager] Session activity updated: {sessionId}");
-            }
+            return _activeSessions.TryGetValue(sessionId, out var session) ? session : null;
         }
         
         /// <summary>
-        /// Gets session data by session ID
+        /// Gets a session by client ID
         /// </summary>
-        public SessionData GetSession(string sessionId)
-        {
-            return _sessions.TryGetValue(sessionId, out var session) ? session : null;
-        }
-        
-        /// <summary>
-        /// Gets session data by client ID (server only)
-        /// </summary>
-        public SessionData GetClientSession(ulong clientId)
+        public UserSession GetClientSession(ulong clientId)
         {
             if (_clientToSession.TryGetValue(clientId, out var sessionId))
             {
@@ -163,121 +133,127 @@ namespace Shared.Networking
         }
         
         /// <summary>
-        /// Destroys a session
+        /// Gets a session by user ID
+        /// </summary>
+        public UserSession GetUserSession(string userId)
+        {
+            return _activeSessions.Values.FirstOrDefault(s => s.UserId == userId && s.IsActive);
+        }
+        
+        /// <summary>
+        /// Updates session activity timestamp (server only)
+        /// </summary>
+        public void UpdateSessionActivity(string sessionId)
+        {
+            if (!IsServer) return;
+            
+            if (_activeSessions.TryGetValue(sessionId, out var session))
+            {
+                session.LastActivity = DateTime.UtcNow;
+                
+                if (debugMode && Time.frameCount % 300 == 0) // Log every 5 seconds at 60fps
+                    Debug.Log($"[SessionManager] Session activity updated - SessionId: {sessionId}");
+            }
+        }
+        
+        /// <summary>
+        /// Updates session activity by client ID (server only)
+        /// </summary>
+        public void UpdateClientActivity(ulong clientId)
+        {
+            if (_clientToSession.TryGetValue(clientId, out var sessionId))
+            {
+                UpdateSessionActivity(sessionId);
+            }
+        }
+        
+        /// <summary>
+        /// Destroys a session (server only)
         /// </summary>
         public void DestroySession(string sessionId)
         {
-            if (_sessions.TryGetValue(sessionId, out var session))
+            if (!IsServer) return;
+            
+            if (_activeSessions.TryGetValue(sessionId, out var session))
             {
-                _sessions.Remove(sessionId);
+                session.IsActive = false;
+                session.EndedAt = DateTime.UtcNow;
                 
-                // Remove client association
-                var clientId = _clientToSession.FirstOrDefault(kvp => kvp.Value == sessionId).Key;
-                if (clientId != 0)
+                // Remove client mapping
+                if (session.ClientId.HasValue)
                 {
-                    _clientToSession.Remove(clientId);
+                    _clientToSession.Remove(session.ClientId.Value);
                 }
+                
+                _activeSessions.Remove(sessionId);
                 
                 if (debugMode)
-                    Debug.Log($"[SessionManager] Session destroyed: {sessionId}");
+                    Debug.Log($"[SessionManager] Session destroyed - SessionId: {sessionId}, UserId: {session.UserId}");
                 
-                OnSessionExpired?.Invoke(sessionId);
-                
-                // Notify client if server
-                if (IsServer && clientId != 0)
-                {
-                    SendSessionExpiredClientRpc(sessionId, new ClientRpcParams 
-                    { 
-                        Send = new ClientRpcSendParams { TargetClientIds = new[] { clientId } } 
-                    });
-                }
+                OnSessionDestroyed?.Invoke(sessionId);
+            }
+        }
+        
+        /// <summary>
+        /// Destroys session by client ID (server only)
+        /// </summary>
+        public void DestroyClientSession(ulong clientId)
+        {
+            if (_clientToSession.TryGetValue(clientId, out var sessionId))
+            {
+                DestroySession(sessionId);
             }
         }
         
         /// <summary>
         /// Gets all active sessions (server only)
         /// </summary>
-        public IEnumerable<SessionData> GetActiveSessions()
+        public IEnumerable<UserSession> GetActiveSessions()
         {
-            return _sessions.Values.Where(s => s.IsValid);
+            return _activeSessions.Values.Where(s => s.IsActive);
         }
         
         /// <summary>
-        /// Gets session count
+        /// Validates if a session is still valid
         /// </summary>
-        public int GetSessionCount()
+        public bool IsSessionValid(string sessionId)
         {
-            return _sessions.Count;
+            if (_activeSessions.TryGetValue(sessionId, out var session))
+            {
+                return session.IsActive && 
+                       DateTime.UtcNow - session.LastActivity <= SessionTimeout;
+            }
+            return false;
         }
         
         #endregion
 
-        #region Server Operations
+        #region Private Methods
         
+        /// <summary>
+        /// Cleans up expired sessions (server only)
+        /// </summary>
         private void CleanupExpiredSessions()
         {
-            var expiredSessions = _sessions.Values
-                .Where(s => s.IsExpired)
+            if (!IsServer) return;
+            
+            var now = DateTime.UtcNow;
+            var expiredSessions = _activeSessions.Values
+                .Where(s => s.IsActive && now - s.LastActivity > SessionTimeout)
                 .ToList();
             
             foreach (var session in expiredSessions)
             {
                 if (debugMode)
-                    Debug.Log($"[SessionManager] Cleaning up expired session: {session.SessionId}");
+                    Debug.Log($"[SessionManager] Session expired - SessionId: {session.SessionId}, UserId: {session.UserId}");
                 
+                OnSessionExpired?.Invoke(session.SessionId);
                 DestroySession(session.SessionId);
             }
-        }
-        
-        #endregion
-
-        #region Client RPCs
-        
-        [ClientRpc]
-        private void SendSessionDataClientRpc(SessionData sessionData, ClientRpcParams rpcParams = default)
-        {
-            _localSession = sessionData;
             
-            if (enableSessionPersistence)
+            if (expiredSessions.Count > 0 && debugMode)
             {
-                SaveLocalSession();
-            }
-            
-            if (debugMode)
-                Debug.Log($"[SessionManager] Received session data: {sessionData.SessionId}");
-        }
-        
-        [ClientRpc]
-        private void SendSessionExpiredClientRpc(string sessionId, ClientRpcParams rpcParams = default)
-        {
-            if (_localSession?.SessionId == sessionId)
-            {
-                _localSession = null;
-                
-                if (enableSessionPersistence)
-                {
-                    ClearLocalSession();
-                }
-                
-                if (debugMode)
-                    Debug.Log($"[SessionManager] Local session expired: {sessionId}");
-                
-                OnSessionExpired?.Invoke(sessionId);
-            }
-        }
-        
-        #endregion
-
-        #region Server RPCs
-        
-        [ServerRpc(RequireOwnership = false)]
-        public void UpdateActivityServerRpc(ServerRpcParams rpcParams = default)
-        {
-            var clientId = rpcParams.Receive.SenderClientId;
-            
-            if (_clientToSession.TryGetValue(clientId, out var sessionId))
-            {
-                UpdateSessionActivity(sessionId);
+                Debug.Log($"[SessionManager] Cleaned up {expiredSessions.Count} expired sessions. Active sessions: {ActiveSessionCount}");
             }
         }
         
@@ -287,117 +263,77 @@ namespace Shared.Networking
         
         public void OnClientDisconnected(ulong clientId)
         {
-            if (IsServer && _clientToSession.TryGetValue(clientId, out var sessionId))
+            if (IsServer)
             {
                 if (debugMode)
-                    Debug.Log($"[SessionManager] Client {clientId} disconnected, destroying session {sessionId}");
+                    Debug.Log($"[SessionManager] Client {clientId} disconnected, destroying session");
                 
-                DestroySession(sessionId);
+                DestroyClientSession(clientId);
             }
         }
         
         #endregion
 
-        #region Persistence
+        #region Server RPCs
         
-        private void SaveLocalSession()
+        [ServerRpc(RequireOwnership = false)]
+        public void PingSessionServerRpc(ServerRpcParams rpcParams = default)
         {
-            if (_localSession == null) return;
-            
-            try
-            {
-                var json = JsonUtility.ToJson(_localSession);
-                PlayerPrefs.SetString("LocalSession", json);
-                PlayerPrefs.Save();
-                
-                if (debugMode)
-                    Debug.Log("[SessionManager] Local session saved");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[SessionManager] Failed to save local session: {ex.Message}");
-            }
+            var clientId = rpcParams.Receive.SenderClientId;
+            UpdateClientActivity(clientId);
         }
         
-        private void LoadLocalSession()
-        {
-            try
-            {
-                var json = PlayerPrefs.GetString("LocalSession", "");
-                if (!string.IsNullOrEmpty(json))
-                {
-                    _localSession = JsonUtility.FromJson<SessionData>(json);
-                    
-                    // Validate loaded session
-                    if (_localSession.IsExpired)
-                    {
-                        _localSession = null;
-                        ClearLocalSession();
-                        
-                        if (debugMode)
-                            Debug.Log("[SessionManager] Loaded session was expired, cleared");
-                    }
-                    else if (debugMode)
-                    {
-                        Debug.Log($"[SessionManager] Local session loaded: {_localSession.SessionId}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[SessionManager] Failed to load local session: {ex.Message}");
-                ClearLocalSession();
-            }
-        }
+        #endregion
+
+        #region Persistence (Future Implementation)
         
-        private void ClearLocalSession()
+        /// <summary>
+        /// Saves session data to persistent storage (future implementation)
+        /// </summary>
+        public void SaveSessionData()
         {
-            PlayerPrefs.DeleteKey("LocalSession");
-            PlayerPrefs.Save();
-            
+            // TODO: Implement session persistence to database or file
             if (debugMode)
-                Debug.Log("[SessionManager] Local session cleared");
+                Debug.Log($"[SessionManager] Saving {ActiveSessionCount} active sessions");
+        }
+        
+        /// <summary>
+        /// Loads session data from persistent storage (future implementation)
+        /// </summary>
+        public void LoadSessionData()
+        {
+            // TODO: Implement session loading from database or file
+            if (debugMode)
+                Debug.Log("[SessionManager] Loading saved sessions");
         }
         
         #endregion
     }
 
     /// <summary>
-    /// Represents session data for an authenticated user
+    /// Represents a user session with persistence and validation data
     /// </summary>
     [System.Serializable]
-    public class SessionData
+    public class UserSession
     {
-        public string SessionId;
-        public string UserId;
-        public string DisplayName;
-        public bool IsGuest;
-        public DateTime CreatedAt;
-        public DateTime LastActivity;
-        public DateTime ExpiresAt;
+        public string SessionId { get; set; }
+        public string UserId { get; set; }
+        public string DisplayName { get; set; }
+        public bool IsGuest { get; set; }
+        public bool IsActive { get; set; }
+        public ulong? ClientId { get; set; }
         
-        // Additional session properties
-        public Dictionary<string, string> Properties = new Dictionary<string, string>();
+        public DateTime CreatedAt { get; set; }
+        public DateTime LastActivity { get; set; }
+        public DateTime? EndedAt { get; set; }
         
-        public bool IsValid => DateTime.UtcNow < ExpiresAt && !string.IsNullOrEmpty(SessionId);
-        public bool IsExpired => DateTime.UtcNow >= ExpiresAt;
-        public TimeSpan TimeRemaining => ExpiresAt - DateTime.UtcNow;
-        public TimeSpan SessionDuration => DateTime.UtcNow - CreatedAt;
+        public TimeSpan Duration => (EndedAt ?? DateTime.UtcNow) - CreatedAt;
+        public TimeSpan TimeSinceLastActivity => DateTime.UtcNow - LastActivity;
+        public bool IsExpired => TimeSinceLastActivity > TimeSpan.FromMinutes(30);
         
-        /// <summary>
-        /// Sets a custom property for this session
-        /// </summary>
-        public void SetProperty(string key, string value)
+        public override string ToString()
         {
-            Properties[key] = value;
-        }
-        
-        /// <summary>
-        /// Gets a custom property for this session
-        /// </summary>
-        public string GetProperty(string key, string defaultValue = null)
-        {
-            return Properties.TryGetValue(key, out var value) ? value : defaultValue;
+            return $"Session[{SessionId}] User: {UserId}({DisplayName}) Active: {IsActive} Client: {ClientId} Duration: {Duration:hh\\:mm\\:ss}";
         }
     }
 }
